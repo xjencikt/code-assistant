@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+pinecone
+langchain
+langchain-text-splitters
+langchain-core
+langchain-google-genai
+google-generativeai
+gitpython
+pydantic

@@ -2,27 +2,34 @@ import os
 import shutil
 import time
 import stat
+import asyncio
+from contextlib import asynccontextmanager
+from typing import AsyncGenerator
+
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.responses import StreamingResponse, HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, HttpUrl
+
 from git import Repo
 from dotenv import load_dotenv
 from pinecone import Pinecone, ServerlessSpec
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 
-# Load variables from .env file
 load_dotenv()
 
-# Configuration constants
+# ── Configuration ────────────────────────────────────────────────────────────
 INDEX_NAME = "codebase-rag"
-EMBEDDING_DIMENSION = 768  # Gemini text-embedding-004 output size
+EMBEDDING_DIMENSION = 768
 SUPPORTED_EXTENSIONS = {
     ".py": "python", ".js": "js", ".ts": "ts",
     ".tsx": "ts", ".jsx": "js", ".go": "go",
     ".java": "java", ".cpp": "cpp"
 }
 
-# 1. Initialize API Clients
+# ── API Clients ───────────────────────────────────────────────────────────────
 pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
 embeddings = GoogleGenerativeAIEmbeddings(
     model="gemini-embedding-2-preview",
@@ -30,205 +37,371 @@ embeddings = GoogleGenerativeAIEmbeddings(
     output_dimensionality=768
 )
 
+# ── In-memory state ───────────────────────────────────────────────────────────
+indexing_status = {
+    "is_indexing": False,
+    "progress": 0,
+    "total": 0,
+    "repo_url": None,
+    "error": None,
+    "done": False,
+}
+
+conversation_history: list[tuple[str, str]] = []
+
+
+# ── Lifespan (startup) ────────────────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_pinecone_index()
+    yield
+
+app = FastAPI(
+    title="Codebase RAG API",
+    description=(
+        "Query any GitHub repository using Retrieval-Augmented Generation.\n\n"
+        "**Workflow:**\n"
+        "1. `POST /index` — Clone & embed a GitHub repo into Pinecone\n"
+        "2. `GET  /status` — Poll indexing progress\n"
+        "3. `POST /query` — Ask questions about the codebase\n"
+        "4. `POST /query/stream` — Same, but tokens stream in real-time\n"
+        "5. `DELETE /index` — Wipe all vectors and reset"
+    ),
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ── Pydantic schemas ──────────────────────────────────────────────────────────
+class IndexRequest(BaseModel):
+    repo_url: str
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {"repo_url": "https://github.com/encode/uvicorn"}
+        }
+    }
+
+
+class QueryRequest(BaseModel):
+    question: str
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {"question": "Where is the server startup loop located?"}
+        }
+    }
+
+
+class QueryResponse(BaseModel):
+    answer: str
+    sources: list[str]
+
+
+class StatusResponse(BaseModel):
+    is_indexing: bool
+    progress: int
+    total: int
+    repo_url: str | None
+    error: str | None
+    done: bool
+
+
+class IndexStatsResponse(BaseModel):
+    total_vectors: int
+    dimension: int
+    metric: str
+
+
+class MessageResponse(BaseModel):
+    message: str
+    repo_url: str | None = None
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 def init_pinecone_index():
-    """Checks if index exists, if not creates a serverless index matching Gemini specs."""
-    existing_indexes = [index.name for index in pc.list_indexes()]
-    
-    if INDEX_NAME not in existing_indexes:
-        print(f"Creating Pinecone index '{INDEX_NAME}'...")
+    existing = [idx.name for idx in pc.list_indexes()]
+    if INDEX_NAME not in existing:
         pc.create_index(
             name=INDEX_NAME,
             dimension=EMBEDDING_DIMENSION,
             metric="cosine",
-            spec=ServerlessSpec(
-                cloud="aws",
-                region="us-east-1"  # Free tier default region for Pinecone serverless
-            )
+            spec=ServerlessSpec(cloud="aws", region="us-east-1"),
         )
-        # Wait a moment for cloud infrastructure provisioning to settle
-        while not pc.describe_index(INDEX_NAME).status['ready']:
+        while not pc.describe_index(INDEX_NAME).status["ready"]:
             time.sleep(1)
-        print("Pinecone index is ready!")
-    else:
-        print(f"Pinecone index '{INDEX_NAME}' already exists.")
+
 
 def on_rm_error(func, path, exc_info):
-    """Clears the read-only bit on Windows so shutil.rmtree can delete .git files."""
     os.chmod(path, stat.S_IWRITE)
     func(path)
 
-def clone_repository(repo_url: str, local_dir: str) -> str:
-    """Clones a GitHub repository to a local directory, handling Windows permissions safely."""
+
+def clone_repository(repo_url: str, local_dir: str):
     if os.path.exists(local_dir):
-        # Use our custom error handler to bypass Windows read-only locks
         shutil.rmtree(local_dir, onerror=on_rm_error)
-    print(f"Cloning {repo_url}...")
     Repo.clone_from(repo_url, local_dir)
-    return local_dir
 
-def load_and_chunk_codebase(repo_dir: str):
-    """Walks through the repo, reads code files, and chunks them intelligently."""
+
+def load_and_chunk_codebase(repo_dir: str) -> list[Document]:
     documents = []
-    
-    # Standardize path separators for safety
-    normalized_repo_dir = os.path.abspath(repo_dir)
+    normalized = os.path.abspath(repo_dir)
 
-    for root, dirs, files in os.walk(normalized_repo_dir):
-        # Fix: ONLY skip hidden system folders like .git, don't break on relative path prefixes
-        parts = os.path.relpath(root, normalized_repo_dir).split(os.sep)
-        if any(part.startswith('.') and part != '.' for part in parts):
+    for root, _, files in os.walk(normalized):
+        parts = os.path.relpath(root, normalized).split(os.sep)
+        if any(p.startswith(".") and p != "." for p in parts):
             continue
-            
         for file in files:
-            file_ext = os.path.splitext(file)[1].lower()
-            if file_ext in SUPPORTED_EXTENSIONS:
-                file_path = os.path.join(root, file)
-                relative_path = os.path.relpath(file_path, normalized_repo_dir)
-                try:
-                    with open(file_path, "r", encoding="utf-8") as f:
-                        code_content = f.read()
-                    
-                    doc = Document(
-                        page_content=code_content,
-                        metadata={
-                            "source": relative_path,
-                            "language": SUPPORTED_EXTENSIONS[file_ext]
-                        }
-                    )
-                    documents.append(doc)
-                except Exception as e:
-                    print(f"Skipping file {relative_path}: {e}")
+            ext = os.path.splitext(file)[1].lower()
+            if ext not in SUPPORTED_EXTENSIONS:
+                continue
+            file_path = os.path.join(root, file)
+            rel_path = os.path.relpath(file_path, normalized)
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                documents.append(Document(
+                    page_content=content,
+                    metadata={"source": rel_path, "language": SUPPORTED_EXTENSIONS[ext]}
+                ))
+            except Exception:
+                pass
 
-    print(f"Successfully read {len(documents)} code files from disk.")
-    
-    chunked_docs = []
+    chunked = []
     for doc in documents:
-        lang = doc.metadata["language"]
         splitter = RecursiveCharacterTextSplitter.from_language(
-            language=lang, chunk_size=1200, chunk_overlap=200
+            language=doc.metadata["language"], chunk_size=1200, chunk_overlap=200
         )
-        chunks = splitter.split_documents([doc])
-        chunked_docs.extend(chunks)
-        
-    return chunked_docs
+        chunked.extend(splitter.split_documents([doc]))
+    return chunked
 
-def index_codebase(repo_url: str):
-    """Orchestrates cloning, chunking, and embedding with conservative rate-limit recovery."""
+
+def run_indexing(repo_url: str):
+    global indexing_status
     local_path = "./temp_repo"
-    
-    # Ensure index exists
-    init_pinecone_index()
-    index = pc.Index(INDEX_NAME)
-    
-    # Extract code elements
-    clone_repository(repo_url, local_path)
-    chunks = load_and_chunk_codebase(local_path)
-    
-    print(f"Generating embeddings and uploading {len(chunks)} vectors to Pinecone...")
-    
-    # Drop batch size to 20 to strictly respect Tokens-Per-Minute limits
-    BATCH_SIZE = 20 
-    
-    for i in range(0, len(chunks), BATCH_SIZE):
-        batch_chunks = chunks[i:i + BATCH_SIZE]
-        texts_to_embed = [chunk.page_content for chunk in batch_chunks]
-        
-        try:
-            batch_vectors = embeddings.embed_documents(texts_to_embed)
-        except Exception as e:
-            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-                # A 65-second sleep completely flushes out Google's sliding minute window
-                print("\n[Quota Alert] Hit rate/token capacity. Pausing for 65 seconds for full reset...")
-                time.sleep(65)
-                print("Resuming index execution...")
-                batch_vectors = embeddings.embed_documents(texts_to_embed)
-            else:
-                raise e
-        
-        vectors_to_upsert = []
-        for j, vector in enumerate(batch_vectors):
-            global_idx = i + j
-            chunk = batch_chunks[j]
-            
-            vectors_to_upsert.append((
-                f"chunk_{global_idx}", 
-                vector, 
-                {
-                    "text": chunk.page_content,
-                    "source": chunk.metadata["source"],
-                    "language": chunk.metadata["language"]
-                }
-            ))
-            
-        index.upsert(vectors=vectors_to_upsert)
-        print(f"Indexed chunks {i} to {min(i + BATCH_SIZE, len(chunks))}...")
-        
-        # Consistent pacing pause between batches
-        time.sleep(3)
-            
-    print("Codebase successfully indexed in Pinecone!")
-    
-    if os.path.exists(local_path):
-        shutil.rmtree(local_path, onerror=on_rm_error)
 
-def query_codebase(user_query: str) -> str:
-    """Finds top relevant code snippets and uses Gemini to answer questions."""
+    try:
+        indexing_status.update(is_indexing=True, done=False, error=None,
+                               repo_url=repo_url, progress=0, total=0)
+
+        print(f"\n[Indexing] Cloning {repo_url}...")
+        clone_repository(repo_url, local_path)
+        print("[Indexing] Cloning done. Reading and chunking files...")
+
+        chunks = load_and_chunk_codebase(local_path)
+        indexing_status["total"] = len(chunks)
+        print(f"[Indexing] {len(chunks)} chunks ready. Starting embedding uploads...\n")
+
+        index = pc.Index(INDEX_NAME)
+        BATCH_SIZE = 20
+
+        for i in range(0, len(chunks), BATCH_SIZE):
+            batch = chunks[i:i + BATCH_SIZE]
+            texts = [c.page_content for c in batch]
+
+            try:
+                vectors = embeddings.embed_documents(texts)
+            except Exception as e:
+                if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                    print("[Indexing] Rate limit hit — pausing 65s...")
+                    time.sleep(65)
+                    print("[Indexing] Resuming...")
+                    vectors = embeddings.embed_documents(texts)
+                else:
+                    raise
+
+            to_upsert = [
+                (f"chunk_{i + j}", vec, {
+                    "text": batch[j].page_content,
+                    "source": batch[j].metadata["source"],
+                    "language": batch[j].metadata["language"],
+                })
+                for j, vec in enumerate(vectors)
+            ]
+            index.upsert(vectors=to_upsert)
+            progress = min(i + BATCH_SIZE, len(chunks))
+            indexing_status["progress"] = progress
+            pct = int(progress / len(chunks) * 100)
+            print(f"[Indexing] {progress}/{len(chunks)} chunks ({pct}%) uploaded...")
+            time.sleep(3)
+
+        indexing_status.update(is_indexing=False, done=True)
+        print(f"\n[Indexing] ✅ Done! {len(chunks)} vectors indexed.\n")
+
+    except Exception as e:
+        print(f"\n[Indexing] ❌ Error: {e}\n")
+        indexing_status.update(is_indexing=False, error=str(e), done=False)
+    finally:
+        if os.path.exists(local_path):
+            shutil.rmtree(local_path, onerror=on_rm_error)
+
+
+# ── Routes ────────────────────────────────────────────────────────────────────
+
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+def root():
+    return """<html><body style="font-family:sans-serif;padding:2rem">
+    <h2>Codebase RAG API</h2>
+    <p>Visit <a href="/docs">/docs</a> for the Swagger UI.</p>
+    </body></html>"""
+
+
+@app.post(
+    "/index",
+    summary="Index a GitHub repository",
+    response_model=MessageResponse,
+    tags=["Indexing"],
+)
+def index_repo(req: IndexRequest, background_tasks: BackgroundTasks):
+    if indexing_status["is_indexing"]:
+        raise HTTPException(status_code=409, detail="Indexing already in progress.")
+    background_tasks.add_task(run_indexing, req.repo_url)
+    return {"message": "Indexing started.", "repo_url": req.repo_url}
+
+
+@app.get(
+    "/status",
+    summary="Get indexing progress",
+    response_model=StatusResponse,
+    tags=["Indexing"],
+)
+def get_status():
+    return indexing_status
+
+
+@app.get(
+    "/stats",
+    summary="Pinecone index statistics",
+    response_model=IndexStatsResponse,
+    tags=["Indexing"],
+)
+def get_stats():
+    stats = pc.Index(INDEX_NAME).describe_index_stats()
+    return {
+        "total_vectors": stats.total_vector_count,
+        "dimension": stats.dimension,
+        "metric": "cosine",
+    }
+
+
+@app.delete(
+    "/index",
+    summary="Wipe all vectors",
+    response_model=MessageResponse,
+    tags=["Indexing"],
+)
+def delete_index():
+    pc.Index(INDEX_NAME).delete(delete_all=True)
+    conversation_history.clear()
+    indexing_status.update(is_indexing=False, progress=0, total=0,
+                           repo_url=None, error=None, done=False)
+    return {"message": "Index wiped and conversation reset."}
+
+
+@app.post(
+    "/query",
+    summary="Ask a question about the codebase",
+    response_model=QueryResponse,
+    tags=["Query"],
+)
+def query(req: QueryRequest):
     index = pc.Index(INDEX_NAME)
-    
-    # 1. Convert user query to vector space using our existing embedding engine
-    query_vector = embeddings.embed_query(user_query)
-    
-    # 2. Retrieve top 4 closest code chunks from Pinecone
-    search_results = index.query(
-        vector=query_vector, 
-        top_k=4, 
-        include_metadata=True
-    )
-    
-    # Construct a string containing our codebase context snippets
-    context_blocks = []
-    for match in search_results.get("matches", []):
+    query_vector = embeddings.embed_query(req.question)
+    results = index.query(vector=query_vector, top_k=4, include_metadata=True)
+
+    context_blocks, sources = [], []
+    for match in results.get("matches", []):
         meta = match.get("metadata", {})
+        sources.append(meta.get("source", "unknown"))
         context_blocks.append(
-            f"--- FILE: {meta.get('source')} ({meta.get('language')}) ---\n"
-            f"{meta.get('text')}\n"
+            f"--- FILE: {meta.get('source')} ({meta.get('language')}) ---\n{meta.get('text')}\n"
         )
-    
+
     context = "\n".join(context_blocks)
-    
-    # 3. Setup Gemini Chat Model to compile the answer
-    llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash", # Using the updated, stable model string
-    temperature=0.2, 
-    google_api_key=os.getenv("GEMINI_API_KEY")
-  )
-    
     system_prompt = (
         "You are an expert software engineering assistant specializing in codebase analysis.\n"
         "Answer the user's questions utilizing ONLY the provided source code blocks as context.\n"
         "When explaining, reference exact file paths and code snippets where applicable.\n"
     )
-    
-    user_prompt = f"Context:\n{context}\n\nQuestion: {user_query}"
-    
-    # Get response from model
-    response = llm.invoke([
-        ("system", system_prompt),
-        ("user", user_prompt)
-    ])
-    
-    return response.content
+    user_prompt = f"Context:\n{context}\n\nQuestion: {req.question}"
 
-if __name__ == "__main__":
-    # 1. Comment out indexing since it's already done
-    # TEST_REPO = "https://github.com/encode/uvicorn" 
-    # index_codebase(TEST_REPO)
-    
-    # 2. Run a live RAG test query!
-    print("\n--- RUNNING BOT QUERY TEST ---")
-    
-    sample_question = "Where is the server startup loop or connection handling located in this codebase?"
-    answer = query_codebase(sample_question)
-    
-    print(f"\nQuestion: {sample_question}")
-    print(f"\nAnswer:\n{answer}")
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash",
+        temperature=0.2,
+        google_api_key=os.getenv("GEMINI_API_KEY"),
+    )
+
+    history_msgs = [(role, msg) for role, msg in conversation_history]
+    response = llm.invoke([("system", system_prompt)] + history_msgs + [("user", user_prompt)])
+
+    conversation_history.append(("user", req.question))
+    conversation_history.append(("assistant", response.content))
+
+    return {"answer": response.content, "sources": list(dict.fromkeys(sources))}
+
+
+@app.post(
+    "/query/stream",
+    summary="Ask a question (streaming)",
+    tags=["Query"],
+    response_class=StreamingResponse,
+    responses={200: {"content": {"text/event-stream": {}}}},
+)
+def query_stream(req: QueryRequest):
+    index = pc.Index(INDEX_NAME)
+    query_vector = embeddings.embed_query(req.question)
+    results = index.query(vector=query_vector, top_k=4, include_metadata=True)
+
+    context_blocks, sources = [], []
+    for match in results.get("matches", []):
+        meta = match.get("metadata", {})
+        sources.append(meta.get("source", "unknown"))
+        context_blocks.append(
+            f"--- FILE: {meta.get('source')} ({meta.get('language')}) ---\n{meta.get('text')}\n"
+        )
+
+    context = "\n".join(context_blocks)
+    system_prompt = (
+        "You are an expert software engineering assistant specializing in codebase analysis.\n"
+        "Answer ONLY from the provided source code context. Reference file paths when relevant.\n"
+    )
+    user_prompt = f"Context:\n{context}\n\nQuestion: {req.question}"
+
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash",
+        temperature=0.2,
+        google_api_key=os.getenv("GEMINI_API_KEY"),
+    )
+
+    history_msgs = [(role, msg) for role, msg in conversation_history]
+
+    def token_generator():
+        full_response = ""
+        for chunk in llm.stream([("system", system_prompt)] + history_msgs + [("user", user_prompt)]):
+            token = chunk.content
+            full_response += token
+            yield f"data: {token}\n\n"
+
+        conversation_history.append(("user", req.question))
+        conversation_history.append(("assistant", full_response))
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(token_generator(), media_type="text/event-stream")
+
+
+@app.delete(
+    "/conversation",
+    summary="Clear conversation history",
+    response_model=MessageResponse,
+    tags=["Query"],
+)
+def clear_conversation():
+    conversation_history.clear()
+    return {"message": "Conversation history cleared."}
