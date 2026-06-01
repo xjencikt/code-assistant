@@ -209,6 +209,8 @@ def load_and_chunk_codebase(repo_dir: str) -> list[Document]:
 
 
 def run_indexing(repo_url: str):
+    global conversation_history
+    conversation_history.clear()
     local_path = tempfile.mkdtemp(prefix="codebase_rag_")
 
     try:
@@ -394,7 +396,7 @@ def query(req: QueryRequest):
     # Retry once on rate limit
     for attempt in range(2):
         try:
-            response = llm.invoke([("system", system_prompt)] + history_msgs + [("user", user_prompt)])
+            response = llm.invoke([("system", system_prompt)] + [("user", user_prompt)])
             break
         except Exception as e:
             if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
@@ -452,7 +454,7 @@ def query_stream(req: QueryRequest):
 
     def token_generator():
         full_response = ""
-        for chunk in llm.stream([("system", system_prompt)] + history_msgs + [("user", user_prompt)]):
+        for chunk in llm.stream([("system", system_prompt)] + [("user", user_prompt)]):
             token = chunk.content
             full_response += token
             yield f"data: {token}\n\n"
