@@ -1,15 +1,16 @@
 import os
+import json
 import shutil
 import time
 import stat
-import asyncio
+import tempfile
+import threading
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import StreamingResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel
 
 from git import Repo
 from dotenv import load_dotenv
@@ -23,6 +24,7 @@ load_dotenv()
 # ── Configuration ────────────────────────────────────────────────────────────
 INDEX_NAME = "codebase-rag"
 EMBEDDING_DIMENSION = 768
+STATE_FILE = os.path.join(tempfile.gettempdir(), "codebase_rag_status.json")
 SUPPORTED_EXTENSIONS = {
     ".py": "python", ".js": "js", ".ts": "ts",
     ".tsx": "ts", ".jsx": "js", ".go": "go",
@@ -37,8 +39,13 @@ embeddings = GoogleGenerativeAIEmbeddings(
     output_dimensionality=768
 )
 
-# ── In-memory state ───────────────────────────────────────────────────────────
-indexing_status = {
+# ── Conversation history ──────────────────────────────────────────────────────
+conversation_history: list[tuple[str, str]] = []
+
+# ── File-based status state ───────────────────────────────────────────────────
+_state_lock = threading.Lock()
+
+DEFAULT_STATUS = {
     "is_indexing": False,
     "progress": 0,
     "total": 0,
@@ -47,14 +54,32 @@ indexing_status = {
     "done": False,
 }
 
-conversation_history: list[tuple[str, str]] = []
+
+def read_status() -> dict:
+    try:
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return DEFAULT_STATUS.copy()
+
+
+def write_status(**kwargs):
+    with _state_lock:
+        current = read_status()
+        current.update(kwargs)
+        with open(STATE_FILE, "w") as f:
+            json.dump(current, f)
 
 
 # ── Lifespan (startup) ────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_pinecone_index()
+    # Reset any stale "is_indexing=True" left from a previous crashed run
+    if read_status()["is_indexing"]:
+        write_status(is_indexing=False, error="Server restarted mid-indexing.")
     yield
+
 
 app = FastAPI(
     title="Codebase RAG API",
@@ -184,20 +209,37 @@ def load_and_chunk_codebase(repo_dir: str) -> list[Document]:
 
 
 def run_indexing(repo_url: str):
-    global indexing_status
-    local_path = "./temp_repo"
+    local_path = tempfile.mkdtemp(prefix="codebase_rag_")
 
     try:
-        indexing_status.update(is_indexing=True, done=False, error=None,
-                               repo_url=repo_url, progress=0, total=0)
+        write_status(is_indexing=True, done=False, error=None,
+                     repo_url=repo_url, progress=0, total=0)
 
-        print(f"\n[Indexing] Cloning {repo_url}...")
+        # Wipe old vectors
+        print("[Indexing] Clearing old vectors...")
+        try:
+            pc.Index(INDEX_NAME).delete(delete_all=True)
+        except Exception as e:
+            if "404" in str(e) or "Namespace not found" in str(e):
+                print("[Indexing] Index already empty, skipping clear.")
+            else:
+                raise
+
+        # Clone
+        print(f"[Indexing] Cloning {repo_url}...")
         clone_repository(repo_url, local_path)
         print("[Indexing] Cloning done. Reading and chunking files...")
 
+        # Chunk
         chunks = load_and_chunk_codebase(local_path)
-        indexing_status["total"] = len(chunks)
+        if not chunks:
+            raise ValueError("No supported source files found in this repository.")
+        write_status(total=len(chunks))
         print(f"[Indexing] {len(chunks)} chunks ready. Starting embedding uploads...\n")
+
+        # Unique IDs per repo to avoid collisions
+        import hashlib
+        repo_slug = hashlib.md5(repo_url.encode()).hexdigest()[:8]
 
         index = pc.Index(INDEX_NAME)
         BATCH_SIZE = 20
@@ -206,6 +248,7 @@ def run_indexing(repo_url: str):
             batch = chunks[i:i + BATCH_SIZE]
             texts = [c.page_content for c in batch]
 
+            # Embed with rate-limit retry
             try:
                 vectors = embeddings.embed_documents(texts)
             except Exception as e:
@@ -218,7 +261,7 @@ def run_indexing(repo_url: str):
                     raise
 
             to_upsert = [
-                (f"chunk_{i + j}", vec, {
+                (f"{repo_slug}_chunk_{i + j}", vec, {
                     "text": batch[j].page_content,
                     "source": batch[j].metadata["source"],
                     "language": batch[j].metadata["language"],
@@ -226,18 +269,20 @@ def run_indexing(repo_url: str):
                 for j, vec in enumerate(vectors)
             ]
             index.upsert(vectors=to_upsert)
+
             progress = min(i + BATCH_SIZE, len(chunks))
-            indexing_status["progress"] = progress
+            write_status(progress=progress)
             pct = int(progress / len(chunks) * 100)
             print(f"[Indexing] {progress}/{len(chunks)} chunks ({pct}%) uploaded...")
             time.sleep(3)
 
-        indexing_status.update(is_indexing=False, done=True)
-        print(f"\n[Indexing] ✅ Done! {len(chunks)} vectors indexed.\n")
+        write_status(is_indexing=False, done=True)
+        print(f"\n[Indexing] Done! {len(chunks)} vectors indexed.\n")
 
     except Exception as e:
-        print(f"\n[Indexing] ❌ Error: {e}\n")
-        indexing_status.update(is_indexing=False, error=str(e), done=False)
+        print(f"\n[Indexing] Error: {e}\n")
+        write_status(is_indexing=False, error=str(e), done=False)
+
     finally:
         if os.path.exists(local_path):
             shutil.rmtree(local_path, onerror=on_rm_error)
@@ -260,7 +305,7 @@ def root():
     tags=["Indexing"],
 )
 def index_repo(req: IndexRequest, background_tasks: BackgroundTasks):
-    if indexing_status["is_indexing"]:
+    if read_status()["is_indexing"]:
         raise HTTPException(status_code=409, detail="Indexing already in progress.")
     background_tasks.add_task(run_indexing, req.repo_url)
     return {"message": "Indexing started.", "repo_url": req.repo_url}
@@ -273,7 +318,7 @@ def index_repo(req: IndexRequest, background_tasks: BackgroundTasks):
     tags=["Indexing"],
 )
 def get_status():
-    return indexing_status
+    return read_status()
 
 
 @app.get(
@@ -300,8 +345,8 @@ def get_stats():
 def delete_index():
     pc.Index(INDEX_NAME).delete(delete_all=True)
     conversation_history.clear()
-    indexing_status.update(is_indexing=False, progress=0, total=0,
-                           repo_url=None, error=None, done=False)
+    write_status(is_indexing=False, progress=0, total=0,
+                 repo_url=None, error=None, done=False)
     return {"message": "Index wiped and conversation reset."}
 
 
@@ -313,6 +358,12 @@ def delete_index():
 )
 def query(req: QueryRequest):
     index = pc.Index(INDEX_NAME)
+
+    # Guard: empty index
+    stats = index.describe_index_stats()
+    if stats.total_vector_count == 0:
+        raise HTTPException(status_code=400, detail="Index is empty. Please index a repository first.")
+
     query_vector = embeddings.embed_query(req.question)
     results = index.query(vector=query_vector, top_k=4, include_metadata=True)
 
@@ -333,19 +384,36 @@ def query(req: QueryRequest):
     user_prompt = f"Context:\n{context}\n\nQuestion: {req.question}"
 
     llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
+        model="gemini-2.0-flash",
         temperature=0.2,
         google_api_key=os.getenv("GEMINI_API_KEY"),
     )
 
     history_msgs = [(role, msg) for role, msg in conversation_history]
-    response = llm.invoke([("system", system_prompt)] + history_msgs + [("user", user_prompt)])
+
+    # Retry once on rate limit
+    for attempt in range(2):
+        try:
+            response = llm.invoke([("system", system_prompt)] + history_msgs + [("user", user_prompt)])
+            break
+        except Exception as e:
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                if attempt == 0:
+                    wait = 60
+                    print(f"[Query] Rate limit hit — waiting {wait}s before retry...")
+                    time.sleep(wait)
+                else:
+                    raise HTTPException(
+                        status_code=429,
+                        detail="Gemini API quota exceeded. Please wait a minute and try again, or enable billing at https://aistudio.google.com"
+                    )
+            else:
+                raise
 
     conversation_history.append(("user", req.question))
     conversation_history.append(("assistant", response.content))
 
     return {"answer": response.content, "sources": list(dict.fromkeys(sources))}
-
 
 @app.post(
     "/query/stream",
